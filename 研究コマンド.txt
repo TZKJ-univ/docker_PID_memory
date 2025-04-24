@@ -1,0 +1,12 @@
+
+./network.sh down
+./network.sh up createChannel
+cd addOrg3
+./addOrg3.sh up
+./addOrg3.sh up
+cd ../
+./network.sh deployCC -ccn basic -ccp ../asset-transfer-basic/chaincode-javascript -ccl javascript
+
+docker stats > result_trans_20btps_mac_resouse.txt
+
+npx caliper launch manager --caliper-workspace ./ --caliper-networkconfig networks/networkConfig.yaml --caliper-benchconfig benchmarks/myAssetBenchmark.yaml --caliper-flow-only-test > ../OneDrive\ -\ 東京都公立大学法人/result_log_all_20ctps_mac.txt
