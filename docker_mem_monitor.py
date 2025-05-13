@@ -1,19 +1,32 @@
 #!/usr/bin/env python3
-"""
-docker_mem_monitor_dual_ts.py
-─────────────────────────────
-1. 1 秒間隔で全コンテナの ps を取得
-2. CSV へ  timestamp, elapsed_sec, container, pid, rss_kb, pmem, nlwp, cmdline
-3. Ctrl-C で終了時にコンテナごと累積 RSS 上位 10 を表示
-"""
 import subprocess, time, csv, datetime, signal, sys, shutil
-from collections import Counter, defaultdict
+from collections import defaultdict
+import re
 
 INTERVAL = 1.0
 TOPN     = 10
 CSV_FILE = "docker_mem_log.csv"
 
-usage   = Counter()
+_UNIT_FACTORS_KB = {
+    'kb': 1, 'kib': 1,
+    'mb': 1024, 'mib': 1024,
+    'gb': 1024 * 1024, 'gib': 1024 * 1024,
+}
+def _to_kb(val):
+    """
+    Convert strings like '12345', '2048kB', '12MB', '1.5GiB' to kB.
+    Default unit is kB when omitted.
+    """
+    if isinstance(val, (int, float)):
+        return float(val)
+    m = re.match(r'([\d.]+)\s*([KMG]i?B?)?', str(val).strip(), re.I)
+    if not m:
+        return 0.0
+    num  = float(m.group(1))
+    unit = (m.group(2) or 'kB').lower().rstrip('b') + 'b'
+    return num * _UNIT_FACTORS_KB.get(unit, 1)
+
+usage   = defaultdict(int)  # track peak RSS per process (kB)
 threads = defaultdict(int)
 mempct  = defaultdict(float)
 
@@ -29,19 +42,17 @@ def cname(cid):
 def busybox(cid):
     return subprocess.call(
         ["docker", "exec", cid, "sh", "-c",
-         'ps --help 2>&1 | grep -q \"BusyBox\"'],
+         'ps --help 2>&1 | grep -q "BusyBox"'],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0
 
-# --- CSV 初期化 ---
+# CSV 初期化
 csv_fh = open(CSV_FILE, "a", newline="")
-csv_writer = csv.writer(csv_fh)
+writer = csv.writer(csv_fh)
 if csv_fh.tell() == 0:
-    csv_writer.writerow([
-        "timestamp", "elapsed_sec", "container", "pid",
-        "rss_kb", "pmem", "nlwp", "cmdline"
-    ])
+    writer.writerow(["timestamp", "elapsed_sec", "container", "pid",
+                     "rss_kb", "pmem", "nlwp", "cmdline"])
 
-t0 = time.time()          # 計測開始基準
+t0 = time.time()
 
 def sample():
     now_iso = datetime.datetime.now().isoformat(timespec="seconds")
@@ -58,54 +69,60 @@ def sample():
         except subprocess.CalledProcessError:
             continue
 
-        for ln in out.strip().splitlines()[1:]:
-            parts = ln.split(None, 5)
+        lines = out.strip().splitlines()
+        if lines and lines[0].lstrip().lower().startswith("pid"):
+            lines = lines[1:]  # drop header if present
+        for ln in lines:
+            parts = ln.split(None, 4)            # 最大 5 つ
             if len(parts) < 3:
                 continue
-            if len(parts) == 4:                      # BusyBox
-                pid, rss, comm, args = parts
-                pmem = 0.0
-                nlwp = 0
-            else:                                    # procps
-                pid, rss, pmem, nlwp, comm, args = parts
-            key = (cn, pid, args)
-            rss_kb = int(rss)
-            usage[key]  += rss_kb
-            mempct[key]+= float(pmem)
-            threads[key]= int(nlwp)
+            pid, rss = parts[0], parts[1]
+            pmem = 0.0
+            nlwp = 0
+            cmdline = parts[-1]
 
-            # --- CSV 出力 ---
-            csv_writer.writerow([
-                now_iso, elapsed, cn, pid, rss_kb,
-                pmem, nlwp, args
-            ])
+            if len(parts) == 5:                  # procps 形式想定
+                try:
+                    pmem = float(parts[2])
+                    nlwp = int(parts[3])
+                except ValueError:
+                    cmdline = " ".join(parts[2:])  # BusyBox の誤検出パターン
+
+            rss_kb = _to_kb(rss)
+            if rss_kb <= 0:
+                continue
+            key = (cn, pid, cmdline)
+            usage[key]  = max(usage.get(key, 0), rss_kb)  # peak value
+            mempct[key] = pmem
+            threads[key] = nlwp
+
+            writer.writerow([now_iso, elapsed, cn, pid,
+                             rss_kb, pmem, nlwp, cmdline])
     csv_fh.flush()
 
 def summary():
-    width = shutil.get_terminal_size((140, 20)).columns
-    sep = "-" * width
+    w = shutil.get_terminal_size((140, 20)).columns
+    sep = "-" * w
     per_c = defaultdict(list)
-    for (cn, pid, args), total in usage.items():
-        per_c[cn].append((total, pid, args))
+    for (cn, pid, cmd), total in usage.items():
+        per_c[cn].append((total, pid, cmd))
     for cn in sorted(per_c):
         print(f"\n\033[1m[{cn}]\033[0m")
-        print(f"{'PID':<8} {'ΣRSS[MiB]':>12} {'Σ%MEM':>8} {'NLWP':>5}  CMDLINE")
+        print(f"{'PID':<8} {'PeakRSS[GiB]':>12} {'%MEM':>8} {'NLWP':>5}  CMDLINE")      
         print(sep)
-        for total, pid, args in sorted(
-                per_c[cn], key=lambda x: x[0], reverse=True)[:TOPN]:
-            rss_mb = total / 1024
-            pmem   = mempct[(cn, pid, args)]
-            nlwp   = threads[(cn, pid, args)]
-            print(f"{pid:<8} {rss_mb:>12.1f} {pmem:>8.1f} {nlwp:>5}  {args}")
+        for tot, pid, cmd in sorted(per_c[cn],
+                                    key=lambda x: x[0], reverse=True)[:TOPN]:
+            print(f"{pid:<8} {tot/1048576:>12.2f} "
+                f"{mempct[(cn,pid,cmd)]:>8.1f} {threads[(cn,pid,cmd)]:>5}  {cmd}")
         print(sep)
 
 def main():
     print("[INFO] 1 秒間隔で計測開始… (Ctrl-C で終了)")
     try:
         while True:
-            t_start = time.time()
+            t = time.time()
             sample()
-            time.sleep(max(0, INTERVAL - (time.time() - t_start)))
+            time.sleep(max(0, INTERVAL - (time.time() - t)))
     except KeyboardInterrupt:
         pass
     finally:

@@ -9,4 +9,4 @@ cd ../
 
 docker stats > result_trans_20btps_mac_resouse.txt
 
-npx caliper launch manager --caliper-workspace ./ --caliper-networkconfig networks/networkConfig.yaml --caliper-benchconfig benchmarks/myAssetBenchmark.yaml --caliper-flow-only-test > ../OneDrive\ -\ 東京都公立大学法人/result_log_all_20ctps_mac.txt
+npx caliper launch manager --caliper-workspace ./ --caliper-networkconfig networks/networkConfig.yaml --caliper-benchconfig benchmarks/myAssetBenchmark.yaml --caliper-flow-only-test > ../OneDrive\ -\ 東京都公立大学法人/result_log_all_dammy.txt   
